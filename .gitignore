@@ -1,0 +1,9 @@
+.env
+.venv/
+memory.db
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+security_lab/audit.jsonl
+knowledge/*
+!knowledge/示例知识.md
