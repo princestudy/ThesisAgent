@@ -57,7 +57,7 @@ Python 工具执行
 
 ## 3. 系统架构
 
-![image-20261111211716261](Thesis_Pic\ThesisArchitecture)
+![image-20261111211716261](Thesis_Pic/ThesisArchitecture.png)
 
 系统采用“模型负责规划、程序负责执行”的架构。模型不能直接操作文件或数据库，它只能提出工具调用请求；真正执行前必须经过本地 Python 代码的权限和参数校验。
 
@@ -403,7 +403,7 @@ LIMIT ?
 
 这比只在提示词中写“不要读取其他用户消息”可靠得多，因为数据库查询本身已经限定了范围。
 
-![image-20261112092342843](Thesis_Pic\db)
+![image-20261112092342843](Thesis_Pic/db.png)
 
 数据表（部分）如图所示，user指代了当前用户，assistant指代的是agent助手（一问一答）。当前默认的 `local-user` 和 `terminal` 只是本地学习用标识，不是真正的登录认证。多用户部署时还必须加入认证、RBAC、租户隔离和数据删除策略。
 
@@ -446,7 +446,7 @@ python -m unittest security_lab.test_offline -v
 
 主要测试“单个安全功能是否正确”，偏向基础单元测试。
 
-![image-20261112080642720](Thesis_Pic\test-offline)
+![image-20261112080642720](Thesis_Pic/test-offline.png)
 
 测试内容包括：
 
@@ -463,7 +463,7 @@ python -m unittest security_lab.test_agent_controls -v
 
 主要测试“Agent 和安全控制配合是否正常”，偏向控制层或集成测试。
 
-![image-20261112081407422](Thesis_Pic\test-agent-controls)
+![image-20261112081407422](Thesis_Pic/test-agent-controls.png)
 
 测试内容包括：
 
@@ -481,7 +481,7 @@ python -m unittest security_lab.test_agent_controls -v
 python -m security_lab.evaluate_online
 ```
 
-![image-20261112082231911](Thesis_Pic\evaluate-online)
+![image-20261112082231911](Thesis_Pic/evaluate-online.png)
 
 运行全部用例：
 
@@ -531,7 +531,7 @@ Windows 用户也可以双击：
 start-agent-web.cmd
 ```
 
-![image-20261112083102734](Thesis_Pic\webPage)
+![image-20261112083102734](Thesis_Pic/webPage.png)
 
 网页端支持：
 
@@ -560,11 +560,11 @@ python main.py
 
 指定文件名直接读取（data目录下的文件）-->read_text_file()
 
-![image-20261112084229888](Thesis_Pic\read-text-files)
+![image-20261112084229888](Thesis_Pic/read-text-files.png)
 
 根据问题搜索相关片段（knowledge目录下的文件）-->search_knowledge_base()
 
-![image-20261112085707595](Thesis_Pic\search-knowledge-base)
+![image-20261112085707595](Thesis_Pic/search-knowledge-base.png)
 
 | 目录         | 工具                    | 使用方式             | 适合场景                     |
 | ------------ | ----------------------- | -------------------- | ---------------------------- |
