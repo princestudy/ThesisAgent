@@ -1,6 +1,6 @@
 # ThesisAgent 技术报告
 
-[github地址](https://github.com/princestudy/ThesisAgent.git)
+ [github地址](https://github.com/princestudy/ThesisAgent.git)
 
 ## 1. 项目概述
 
