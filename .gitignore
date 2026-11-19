@@ -1,0 +1,14 @@
+.env
+.venv/
+memory.db
+memory.db-wal
+memory.db-shm
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+security_lab/audit.jsonl
+knowledge/*
+!knowledge/示例知识.md
+data/users/
+security_lab/__pycache__
+Thesis_pic/

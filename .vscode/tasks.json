@@ -1,0 +1,26 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Check Development Environment",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\check-environment.ps1"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "Run Agent CLI",
+      "type": "shell",
+      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "args": [
+        "${workspaceFolder}\\main.py"
+      ],
+      "problemMatcher": []
+    }
+  ]
+}
