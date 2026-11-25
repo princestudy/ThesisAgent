@@ -32,11 +32,6 @@ LOCK_MINUTES = 15
 MIN_PASSWORD_LENGTH = 8
 MAX_PASSWORD_LENGTH = 128
 MAX_USERS = max(1, config.get_int("MAX_USERS", 200))
-# 部署级配置：固定管理员账号（ADMIN_USERNAME + ADMIN_PASSWORD），以及注册邀请码。
-# 不配置时保持"第一个注册者是管理员、开放注册"的旧行为。
-ADMIN_USERNAME = str(config.get("ADMIN_USERNAME", "")).strip()
-ADMIN_PASSWORD = str(config.get("ADMIN_PASSWORD", "")).strip()
-INVITE_CODE = str(config.get("INVITE_CODE", "")).strip()
 SCRYPT_N = 2**14
 SCRYPT_R = 8
 SCRYPT_P = 1
@@ -193,24 +188,57 @@ def _insert_user(
     }
 
 
+def _deploy_config(name: str) -> str:
+    """部署级配置每次都读最新的值；模块属性被显式覆盖时以覆盖值为准（便于测试/应急）。"""
+    override = globals().get(name)
+    if override is not None:
+        return str(override).strip()
+    return str(config.get(name, "")).strip()
+
+
+def admin_username() -> str:
+    return _deploy_config("ADMIN_USERNAME")
+
+
+def admin_password() -> str:
+    return _deploy_config("ADMIN_PASSWORD")
+
+
+def invite_code() -> str:
+    return _deploy_config("INVITE_CODE")
+
+
+def __getattr__(name: str):
+    """保留 `auth.ADMIN_USERNAME` 这种写法，但每次访问都取最新配置。"""
+    if name == "ADMIN_USERNAME":
+        return admin_username()
+    if name == "ADMIN_PASSWORD":
+        return admin_password()
+    if name == "INVITE_CODE":
+        return invite_code()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 def register_user(
-    username: str, password: str, invite_code: str | None = None
+    username: str, password: str, invite_code_input: str | None = None
 ) -> dict[str, object]:
     """开放注册。
 
-    - 配置了 `INVITE_CODE` 时必须带对邀请码；
+    - 配置了邀请码时必须带对；
     - 配置了 `ADMIN_USERNAME` 时只有这个用户名会成为管理员，其他都是普通用户；
     - 两者都没配置时，沿用"第一个注册者自动成为唯一管理员"。
     """
-    if INVITE_CODE and (invite_code or "").strip() != INVITE_CODE:
+    code = invite_code()
+    if code and (invite_code_input or "").strip() != code:
         raise AuthError("邀请码不正确，请向管理员索取。")
     candidate = validate_username(username)
     validate_password(password)
     if password.lower() == candidate.lower():
         raise AuthError("密码不能和用户名相同。")
 
-    if ADMIN_USERNAME:
-        is_admin: bool | None = candidate.lower() == ADMIN_USERNAME.lower()
+    fixed_admin = admin_username()
+    if fixed_admin:
+        is_admin: bool | None = candidate.lower() == fixed_admin.lower()
         if is_admin and has_admin():
             raise AuthError("管理员账号已经存在。")
     else:
@@ -220,15 +248,17 @@ def register_user(
 
 def ensure_admin_account() -> str | None:
     """按配置保证有一个固定的管理员账号；返回提示文案（None 表示正常）。"""
-    if not ADMIN_USERNAME or not ADMIN_PASSWORD:
+    fixed_admin = admin_username()
+    fixed_password = admin_password()
+    if not fixed_admin or not fixed_password:
         return None
     try:
-        username = validate_username(ADMIN_USERNAME)
+        username = validate_username(fixed_admin)
     except AuthError:
         return (
             "配置的 ADMIN_USERNAME 不合法：需要 3-32 位字母、数字、下划线、点或短横线。"
         )
-    if len(ADMIN_PASSWORD) < MIN_PASSWORD_LENGTH:
+    if len(fixed_password) < MIN_PASSWORD_LENGTH:
         return f"配置的 ADMIN_PASSWORD 太短，至少要 {MIN_PASSWORD_LENGTH} 位。"
 
     existing = get_user(username)
@@ -249,7 +279,7 @@ def ensure_admin_account() -> str | None:
     if has_admin():
         return None
     try:
-        _insert_user(username, ADMIN_PASSWORD, is_admin=True)
+        _insert_user(username, fixed_password, is_admin=True)
     except AuthError as error:
         return f"创建固定管理员失败：{error}"
     return None
