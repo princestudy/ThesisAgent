@@ -433,12 +433,23 @@ def render_login_form() -> None:
 
 def render_register_form() -> None:
     if not auth.has_admin():
-        st.info("系统里还没有账号，第一个注册的账号会成为唯一管理员。")
+        if auth.ADMIN_USERNAME:
+            st.info("管理员账号由部署者预先配置，这里注册的都是普通用户。")
+        else:
+            st.info("系统里还没有账号，第一个注册的账号会成为唯一管理员。")
+    if auth.INVITE_CODE:
+        st.caption("注册需要邀请码，请向管理员索取。")
 
     with st.form("register_form"):
         username = st.text_input("用户名", placeholder="3-32 位字母、数字、下划线、点或短横线")
         password = st.text_input("密码", type="password", placeholder="至少 8 位")
         confirm = st.text_input("确认密码", type="password", placeholder="再输入一次密码")
+        invite = st.text_input(
+            "邀请码",
+            type="password",
+            placeholder="请输入邀请码",
+            help="由部署者在 Secrets 里配置；没有配置时可以留空。",
+        ) if auth.INVITE_CODE else ""
         submitted = st.form_submit_button(
             "创建账号", use_container_width=True, type="primary"
         )
@@ -449,7 +460,7 @@ def render_register_form() -> None:
         st.error("两次输入的密码不一致。")
         return
     try:
-        user = auth.register_user(username, password)
+        user = auth.register_user(username, password, invite)
     except AuthError as error:
         st.error(str(error))
         return
@@ -472,7 +483,9 @@ def render_auth_page() -> None:
             render_login_form()
         with register_tab:
             render_register_form()
-        st.caption("Key 只存内存 · 资料按账号隔离 · 首个账号即管理员")
+        footer = "Key 只存内存 · 资料按账号隔离 · "
+        footer += "管理员由部署者固定" if auth.ADMIN_USERNAME else "首个账号即管理员"
+        st.caption(footer)
 
 
 def render_api_key_step() -> None:
@@ -1152,6 +1165,13 @@ def handle_prompt(scope: ToolScope) -> None:
 
 def main() -> None:
     inject_styles()
+
+    try:
+        admin_hint = auth.ensure_admin_account()
+    except Exception:  # noqa: BLE001 - 初始化失败不应该让整页打不开
+        admin_hint = "固定管理员账号初始化失败，请检查 Secrets 里的 ADMIN_USERNAME / ADMIN_PASSWORD。"
+    if admin_hint:
+        st.warning(admin_hint)
 
     user = st.session_state.get("user")
     if not user:

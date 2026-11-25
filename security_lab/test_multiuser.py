@@ -422,5 +422,71 @@ class AgentKeyTests(unittest.TestCase):
         self.assertIsNotNone(instance.client)
 
 
+class DeploymentAdminTests(unittest.TestCase):
+    """部署级配置：固定管理员账号 + 注册邀请码。"""
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.database = Path(self.temporary_directory.name) / "memory.db"
+        patcher = patch("memory.DB_PATH", self.database)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        memory.initialize_database()
+        auth.initialize_auth_database()
+
+    def test_invite_code_is_required_when_configured(self) -> None:
+        with patch.object(auth, "INVITE_CODE", "letmein"):
+            with self.assertRaises(AuthError):
+                register_user("alice", "alicepass123")
+            with self.assertRaises(AuthError):
+                register_user("alice", "alicepass123", "wrong")
+            user = register_user("alice", "alicepass123", "letmein")
+        self.assertEqual(user["username"], "alice")
+        self.assertTrue(user["is_admin"])
+
+    def test_fixed_admin_is_created_from_config(self) -> None:
+        with patch.object(auth, "ADMIN_USERNAME", "boss"), patch.object(
+            auth, "ADMIN_PASSWORD", "bosspass123"
+        ):
+            self.assertIsNone(auth.ensure_admin_account())
+            admin = auth.get_user("boss")
+            self.assertIsNotNone(admin)
+            self.assertTrue(admin["is_admin"])
+            # 幂等：再跑一次不会报错、也不会重复创建
+            self.assertIsNone(auth.ensure_admin_account())
+            self.assertEqual(auth.count_users(), 1)
+            # 其他账号注册后都是普通用户
+            other = register_user("alice", "alicepass123")
+            self.assertFalse(other["is_admin"])
+            user, _ = authenticate("boss", "bosspass123")
+            self.assertIsNotNone(user)
+            self.assertTrue(user["is_admin"])
+
+    def test_configured_admin_name_cannot_be_hijacked_twice(self) -> None:
+        with patch.object(auth, "ADMIN_USERNAME", "boss"), patch.object(
+            auth, "ADMIN_PASSWORD", "bosspass123"
+        ):
+            auth.ensure_admin_account()
+            with self.assertRaises(AuthError):
+                register_user("boss", "anotherpass123")
+
+    def test_fixed_admin_promotes_existing_account(self) -> None:
+        register_user("boss", "bosspass123")
+        with patch.object(auth, "ADMIN_USERNAME", "boss"), patch.object(
+            auth, "ADMIN_PASSWORD", "bosspass123"
+        ):
+            self.assertIsNone(auth.ensure_admin_account())
+            boss = auth.get_user("boss")
+        self.assertTrue(boss["is_admin"])
+        self.assertEqual(auth.count_users(), 1)
+
+    def test_bad_admin_config_reports_hint_instead_of_crashing(self) -> None:
+        with patch.object(auth, "ADMIN_USERNAME", "x"), patch.object(
+            auth, "ADMIN_PASSWORD", "short"
+        ):
+            hint = auth.ensure_admin_account()
+        self.assertIsNotNone(hint)
+        self.assertIn("ADMIN", hint)
 if __name__ == "__main__":
     unittest.main()

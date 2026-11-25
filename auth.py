@@ -32,6 +32,11 @@ LOCK_MINUTES = 15
 MIN_PASSWORD_LENGTH = 8
 MAX_PASSWORD_LENGTH = 128
 MAX_USERS = max(1, config.get_int("MAX_USERS", 200))
+# 部署级配置：固定管理员账号（ADMIN_USERNAME + ADMIN_PASSWORD），以及注册邀请码。
+# 不配置时保持"第一个注册者是管理员、开放注册"的旧行为。
+ADMIN_USERNAME = str(config.get("ADMIN_USERNAME", "")).strip()
+ADMIN_PASSWORD = str(config.get("ADMIN_PASSWORD", "")).strip()
+INVITE_CODE = str(config.get("INVITE_CODE", "")).strip()
 SCRYPT_N = 2**14
 SCRYPT_R = 8
 SCRYPT_P = 1
@@ -153,12 +158,10 @@ def validate_password(password: str) -> str:
     return password
 
 
-def register_user(username: str, password: str) -> dict[str, object]:
-    """开放注册：系统里的第一个注册者自动成为唯一管理员，之后注册的都是普通用户。"""
-    candidate = validate_username(username)
-    validate_password(password)
-    if password.lower() == candidate.lower():
-        raise AuthError("密码不能和用户名相同。")
+def _insert_user(
+    username: str, password: str, *, is_admin: bool | None = None
+) -> dict[str, object]:
+    """写入一个账号；is_admin 为 None 表示沿用"第一个注册者是管理员"的规则。"""
     salt = secrets.token_bytes(16)
     password_hash = _hash_password(password, salt)
 
@@ -168,12 +171,12 @@ def register_user(username: str, password: str) -> dict[str, object]:
         if total >= MAX_USERS:
             connection.rollback()
             raise AuthError(f"注册人数已达上限（{MAX_USERS} 人），请联系管理员。")
-        is_admin = total == 0
+        admin_flag = (total == 0) if is_admin is None else is_admin
         try:
             cursor = connection.execute(
                 "INSERT INTO users (username, password_salt, password_hash, is_admin) "
                 "VALUES (?, ?, ?, ?)",
-                (candidate, salt.hex(), password_hash, int(is_admin)),
+                (username, salt.hex(), password_hash, int(admin_flag)),
             )
             connection.commit()
         except sqlite3.IntegrityError as error:
@@ -185,9 +188,71 @@ def register_user(username: str, password: str) -> dict[str, object]:
 
     return {
         "id": int(cursor.lastrowid or 0),
-        "username": candidate,
-        "is_admin": is_admin,
+        "username": username,
+        "is_admin": bool(admin_flag),
     }
+
+
+def register_user(
+    username: str, password: str, invite_code: str | None = None
+) -> dict[str, object]:
+    """开放注册。
+
+    - 配置了 `INVITE_CODE` 时必须带对邀请码；
+    - 配置了 `ADMIN_USERNAME` 时只有这个用户名会成为管理员，其他都是普通用户；
+    - 两者都没配置时，沿用"第一个注册者自动成为唯一管理员"。
+    """
+    if INVITE_CODE and (invite_code or "").strip() != INVITE_CODE:
+        raise AuthError("邀请码不正确，请向管理员索取。")
+    candidate = validate_username(username)
+    validate_password(password)
+    if password.lower() == candidate.lower():
+        raise AuthError("密码不能和用户名相同。")
+
+    if ADMIN_USERNAME:
+        is_admin: bool | None = candidate.lower() == ADMIN_USERNAME.lower()
+        if is_admin and has_admin():
+            raise AuthError("管理员账号已经存在。")
+    else:
+        is_admin = None
+    return _insert_user(candidate, password, is_admin=is_admin)
+
+
+def ensure_admin_account() -> str | None:
+    """按配置保证有一个固定的管理员账号；返回提示文案（None 表示正常）。"""
+    if not ADMIN_USERNAME or not ADMIN_PASSWORD:
+        return None
+    try:
+        username = validate_username(ADMIN_USERNAME)
+    except AuthError:
+        return (
+            "配置的 ADMIN_USERNAME 不合法：需要 3-32 位字母、数字、下划线、点或短横线。"
+        )
+    if len(ADMIN_PASSWORD) < MIN_PASSWORD_LENGTH:
+        return f"配置的 ADMIN_PASSWORD 太短，至少要 {MIN_PASSWORD_LENGTH} 位。"
+
+    existing = get_user(username)
+    if existing:
+        if existing["is_admin"]:
+            return None
+        if has_admin():
+            return f"用户名 {username} 已经被普通用户占用，请换一个 ADMIN_USERNAME。"
+        with closing(_connect()) as connection:
+            connection.execute(
+                "UPDATE users SET is_admin = 1, is_disabled = 0, "
+                "failed_attempts = 0, locked_until = NULL WHERE id = ?",
+                (existing["id"],),
+            )
+            connection.commit()
+        return None
+
+    if has_admin():
+        return None
+    try:
+        _insert_user(username, ADMIN_PASSWORD, is_admin=True)
+    except AuthError as error:
+        return f"创建固定管理员失败：{error}"
+    return None
 
 
 def _row_to_user(row: sqlite3.Row) -> dict[str, object]:
