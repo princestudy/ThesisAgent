@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -99,6 +100,105 @@ class AgentControlTests(unittest.TestCase):
                     ],
                     "用户 B 的消息",
                 )
+
+
+def _content_chunk(text: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(content=text, tool_calls=None),
+            )
+        ]
+    )
+
+
+def _tool_chunk(index: int, call_id: str, name: str, arguments: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(
+                    content=None,
+                    tool_calls=[
+                        SimpleNamespace(
+                            index=index,
+                            id=call_id,
+                            function=SimpleNamespace(name=name, arguments=arguments),
+                        )
+                    ],
+                ),
+            )
+        ]
+    )
+
+
+class ScriptedStreamResponses:
+    def __init__(self, rounds: list[list[SimpleNamespace]]) -> None:
+        self._rounds = [list(round_chunks) for round_chunks in rounds]
+        self.requests: list[dict] = []
+
+    def create(self, **parameters: object) -> list[SimpleNamespace]:
+        self.requests.append(parameters)
+        return self._rounds.pop(0)
+
+
+class ScriptedStreamClient:
+    def __init__(self, rounds: list[list[SimpleNamespace]]) -> None:
+        self.responses = ScriptedStreamResponses(rounds)
+        self.chat = SimpleNamespace(completions=self.responses)
+
+
+class StreamingTests(unittest.TestCase):
+    def test_stream_yields_content_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audit_path = Path(temporary_directory) / "audit.jsonl"
+            logger = AuditLogger(audit_path)
+            client = ScriptedStreamClient([[_content_chunk("你好"), _content_chunk("，世界")]])
+            agent = Agent(
+                client=cast(OpenAI, client),
+                model="test-model",
+                audit_logger=logger,
+            )
+
+            chunks = list(agent.stream([{"role": "user", "content": "打个招呼"}]))
+
+            self.assertEqual(chunks, ["你好", "，世界"])
+            self.assertTrue(client.responses.requests[0]["stream"])
+            records = [
+                json.loads(line) for line in audit_path.read_text("utf-8").splitlines()
+            ]
+            self.assertIn("agent_completed", [record["event"] for record in records])
+
+    def test_stream_runs_tool_then_continues_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            audit_path = Path(temporary_directory) / "audit.jsonl"
+            logger = AuditLogger(audit_path)
+            client = ScriptedStreamClient(
+                [
+                    [_tool_chunk(0, "call-mul", "calculate", '{"expression": "6*7"}')],
+                    [_content_chunk("结果是 42。")],
+                ]
+            )
+            agent = Agent(
+                client=cast(OpenAI, client),
+                model="test-model",
+                audit_logger=logger,
+            )
+
+            chunks = list(agent.stream([{"role": "user", "content": "6*7 等于多少"}]))
+
+            self.assertEqual(chunks, ["结果是 42。"])
+            second_round_messages = client.responses.requests[1]["messages"]
+            tool_messages = [
+                message for message in second_round_messages if message.get("role") == "tool"
+            ]
+            self.assertEqual(tool_messages[0]["content"], "42")
+            records = [
+                json.loads(line) for line in audit_path.read_text("utf-8").splitlines()
+            ]
+            tool_events = [
+                record for record in records if record["event"] == "tool_call"
+            ]
+            self.assertEqual(tool_events[0]["details"]["tool_name"], "calculate")
 
 
 if __name__ == "__main__":

@@ -18,7 +18,13 @@ from auth import (
     set_disabled,
 )
 from knowledge_base import search_knowledge_base
-from scope import ToolScope, delete_scope_file, iter_scope_files, upload_directory
+from scope import (
+    ToolScope,
+    delete_scope_file,
+    iter_scope_files,
+    read_scope_file,
+    upload_directory,
+)
 from security_controls import (
     AuditLogger,
     ToolArgumentError,
@@ -254,6 +260,61 @@ class DeleteFileTests(unittest.TestCase):
         self.assertTrue(self.private_dir.exists())
 
 
+class ReadFileTests(unittest.TestCase):
+    """查看/下载资料的读取边界：只能读自己作用域里的白名单文件。"""
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.scope_a = build_scope(self.root, "1")
+        self.scope_a.ensure_directories()
+        self.private_dir = self.scope_a.knowledge_dirs[0]
+        self.shared_dir = self.root / "knowledge" / "shared"
+        self.shared_dir.mkdir(parents=True, exist_ok=True)
+
+    def test_read_own_file(self) -> None:
+        target = self.private_dir / "笔记.md"
+        target.write_bytes("# 标题\n正文".encode("utf-8"))
+        self.assertEqual(read_scope_file(target, self.private_dir), "# 标题\n正文".encode())
+
+    def test_read_shared_file(self) -> None:
+        target = self.shared_dir / "共享.md"
+        target.write_text("共享内容", encoding="utf-8")
+        self.assertEqual(read_scope_file(target, self.shared_dir), "共享内容".encode())
+
+    def test_cannot_read_from_other_directory(self) -> None:
+        target = self.private_dir / "笔记.md"
+        target.write_text("私有", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            read_scope_file(target, self.shared_dir)
+
+    def test_cannot_read_outside_scope(self) -> None:
+        outside = self.root / "outside.md"
+        outside.write_text("作用域外", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            read_scope_file(outside, self.private_dir)
+
+    def test_cannot_read_traversal_path(self) -> None:
+        outside = self.root / "outside.md"
+        outside.write_text("作用域外", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            read_scope_file(self.private_dir / ".." / ".." / "outside.md", self.private_dir)
+
+    def test_rejects_directory_and_unlisted_suffix(self) -> None:
+        with self.assertRaises(ValueError):
+            read_scope_file(self.private_dir, self.private_dir)
+        secret = self.private_dir / "secret.exe"
+        secret.write_bytes(b"MZ")
+        with self.assertRaises(ValueError):
+            read_scope_file(secret, self.private_dir)
+
+    def test_rejects_oversized_file(self) -> None:
+        big = self.private_dir / "big.txt"
+        big.write_text("x" * 32, encoding="utf-8")
+        with self.assertRaises(ValueError):
+            read_scope_file(big, self.private_dir, max_bytes=16)
+
 class AuditRedactionTests(unittest.TestCase):
     def test_api_key_detection_and_masking(self) -> None:
         key = "sk-1234567890abcdefghij"
@@ -278,6 +339,87 @@ class AuditRedactionTests(unittest.TestCase):
             # 脱敏后每一行仍然是合法 JSON，审计日志本身不能因为脱敏而损坏。
             for line in text.splitlines():
                 json.loads(line)
+
+
+class ConversationTests(unittest.TestCase):
+    """多对话：默认会话、上限、按用户隔离、删除时连带清理消息。"""
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.database = Path(self.temporary_directory.name) / "memory.db"
+        patcher = patch("memory.DB_PATH", self.database)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        memory.initialize_database()
+
+    def test_default_conversation_is_created_once(self) -> None:
+        first = memory.ensure_default_conversation("1")
+        second = memory.ensure_default_conversation("1")
+        self.assertEqual(first, second)
+        self.assertEqual(len(memory.list_conversations("1")), 1)
+
+    def test_conversation_limit(self) -> None:
+        memory.ensure_default_conversation("1")
+        while memory.count_conversations("1") < memory.MAX_CONVERSATIONS:
+            memory.create_conversation("1")
+        with self.assertRaises(memory.ConversationLimitError):
+            memory.create_conversation("1")
+        self.assertEqual(
+            memory.count_conversations("1"), memory.MAX_CONVERSATIONS
+        )
+
+    def test_conversations_are_isolated_between_users(self) -> None:
+        memory.create_conversation("1", "alice 的对话")
+        memory.create_conversation("2", "bob 的对话")
+        self.assertEqual(
+            [item["title"] for item in memory.list_conversations("1")],
+            ["alice 的对话"],
+        )
+        self.assertEqual(
+            [item["title"] for item in memory.list_conversations("2")],
+            ["bob 的对话"],
+        )
+        # 拿别人的会话 id 读不到内容
+        other = memory.list_conversations("2")[0]["id"]
+        self.assertIsNone(memory.get_conversation(other, "1"))
+
+    def test_delete_conversation_removes_its_messages(self) -> None:
+        conversation_id = memory.ensure_default_conversation("1")
+        memory.save_message("user", "你好", "1", conversation_id)
+        memory.touch_conversation(conversation_id, "1")
+        memory.delete_conversation(conversation_id, "1")
+        self.assertIsNone(memory.get_conversation(conversation_id, "1"))
+        self.assertEqual(memory.load_recent_messages(10, "1", conversation_id), [])
+
+    def test_legacy_web_session_is_adopted(self) -> None:
+        memory.save_message("user", "旧版历史", "1", memory.LEGACY_CONVERSATION_ID)
+        adopted = memory.ensure_default_conversation("1")
+        self.assertEqual(adopted, memory.LEGACY_CONVERSATION_ID)
+        self.assertEqual(
+            memory.list_conversations("1")[0]["title"],
+            memory.LEGACY_CONVERSATION_TITLE,
+        )
+        self.assertEqual(
+            len(memory.load_recent_messages(10, "1", adopted)), 1
+        )
+
+
+class AgentKeyTests(unittest.TestCase):
+    def test_agent_requires_explicit_key(self) -> None:
+        """项目文件里不再有 Key，所以不传 key 必须直接报错。"""
+        import agent
+
+        with patch.dict("os.environ", {"OPENAI_API_KEY": ""}):
+            with self.assertRaises(RuntimeError) as context:
+                agent.Agent()
+        self.assertIn("API Key", str(context.exception))
+
+    def test_agent_accepts_explicit_key(self) -> None:
+        import agent
+
+        instance = agent.Agent(api_key="sk-test-key-1234567890")
+        self.assertIsNotNone(instance.client)
 
 
 if __name__ == "__main__":

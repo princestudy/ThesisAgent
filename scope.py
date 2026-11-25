@@ -143,3 +143,43 @@ def delete_scope_file(path: Path, directory: Path) -> None:
         target.unlink()
     except OSError as error:
         raise ValueError(f"删除失败：{error}") from error
+
+
+MAX_PREVIEW_BYTES = 8 * 1024 * 1024
+
+
+def read_scope_file(
+    path: Path,
+    directory: Path,
+    *,
+    max_bytes: int = MAX_PREVIEW_BYTES,
+) -> bytes:
+    """读取作用域目录里的一个资料文件，用于预览和下载。
+
+    和 delete_scope_file 一样的边界检查：必须是白名单后缀的普通文件、解析后的
+    路径仍然落在给定目录里、且大小不超过 max_bytes。
+    """
+    original = Path(path)
+    if original.is_symlink():
+        raise ValueError("不能读取符号链接。")
+    try:
+        root = Path(directory).resolve()
+        target = original.resolve()
+    except OSError as error:
+        raise ValueError("文件无法访问。") from error
+    if target == root or root not in target.parents:
+        raise ValueError("只能查看自己资料目录里的文件。")
+    if not target.is_file():
+        raise ValueError("只能查看文件。")
+    if target.suffix.lower() not in SUPPORTED_KNOWLEDGE_SUFFIXES:
+        raise ValueError("不支持查看这种类型的文件。")
+    try:
+        size = target.stat().st_size
+        if size > max_bytes:
+            raise ValueError(
+                f"文件太大（{size / 1024 / 1024:.1f} MB），超过 "
+                f"{max_bytes // 1024 // 1024} MB 的查看上限。"
+            )
+        return target.read_bytes()
+    except OSError as error:
+        raise ValueError(f"读取失败：{error}") from error

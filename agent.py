@@ -201,16 +201,17 @@ class Agent:
         base_url: str | None = None,
     ) -> None:
         load_dotenv()
-        env_api_key = os.getenv("OPENAI_API_KEY", "").strip()
         configured_model = os.getenv("OPENAI_MODEL", "").strip()
         env_base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
 
         self.model = model or configured_model
         if client is None:
-            provided_key = (api_key or "").strip() or env_api_key
-            if not provided_key or provided_key == "在这里填写你的_API_Key":
+            # 项目文件里不再保存任何 API Key：key 只能由调用方显式传入
+            # （网页版由登录用户输入，终端版由 main.py 在启动时询问）。
+            provided_key = (api_key or "").strip()
+            if not provided_key:
                 raise RuntimeError(
-                    "缺少 API Key：请在登录后输入，或在 .env 中配置 OPENAI_API_KEY。"
+                    "缺少 API Key：请在登录后输入（终端版启动时会提示输入）。"
                 )
             if not self.model or self.model == "在这里填写模型名称":
                 raise RuntimeError("请先填写模型名称（OPENAI_MODEL）。")
@@ -341,6 +342,158 @@ class Agent:
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
+                        "content": tool_result,
+                    }
+                )
+
+        self.audit_logger.record(
+            "security_limit_exceeded",
+            request_id=request_id,
+            user_id=user_id,
+            session_id=session_id,
+            reason="tool_round_budget",
+            tool_rounds=tool_rounds,
+            tool_calls=tool_call_count,
+        )
+        raise RuntimeError("工具调用轮次超过安全上限")
+
+    def stream(
+        self,
+        messages: list[dict],
+        on_tool: Callable[[str, dict, str], None] | None = None,
+        request_id: str = "local-request",
+        user_id: str = "local-user",
+        session_id: str = "local-session",
+        scope: ToolScope | None = None,
+    ):
+        """和 run() 等价，但把模型输出按增量逐段 yield 出去，便于边生成边显示。
+
+        工具调用、轮次预算、审计记录与 run() 完全一致；调用方消费完这个生成器后，
+        把收到的片段拼起来就是最终回答。
+        """
+        active_scope = scope or ToolScope.local()
+        working_messages = [dict(message) for message in messages]
+        if not working_messages or working_messages[0].get("role") != "system":
+            working_messages.insert(0, build_system_message(active_scope))
+
+        tool_rounds = 0
+        tool_call_count = 0
+
+        while tool_rounds < MAX_TOOL_ROUNDS:
+            tool_rounds += 1
+            stream = self.client.chat.completions.create(
+                model=self.model,
+                messages=cast(Iterable[ChatCompletionMessageParam], working_messages),
+                tools=cast(Iterable[ChatCompletionToolUnionParam], TOOLS),
+                tool_choice="auto",
+                stream=True,
+            )
+
+            round_text: list[str] = []
+            pending_calls: dict[int, dict] = {}
+
+            for chunk in stream:
+                if not getattr(chunk, "choices", None):
+                    continue
+                delta = chunk.choices[0].delta
+                if delta is None:
+                    continue
+                if delta.content:
+                    round_text.append(delta.content)
+                    yield delta.content
+                for call_delta in delta.tool_calls or []:
+                    slot = pending_calls.setdefault(
+                        call_delta.index,
+                        {"id": "", "name": "", "arguments": ""},
+                    )
+                    if call_delta.id:
+                        slot["id"] = call_delta.id
+                    if call_delta.function is not None:
+                        if call_delta.function.name:
+                            slot["name"] = call_delta.function.name
+                        if call_delta.function.arguments:
+                            slot["arguments"] += call_delta.function.arguments
+
+            if not pending_calls:
+                self.audit_logger.record(
+                    "agent_completed",
+                    request_id=request_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    tool_rounds=tool_rounds,
+                    tool_calls=tool_call_count,
+                )
+                return
+
+            tool_calls = [
+                pending_calls[index] for index in sorted(pending_calls)
+            ]
+            if tool_call_count + len(tool_calls) > MAX_TOOL_CALLS:
+                self.audit_logger.record(
+                    "security_limit_exceeded",
+                    request_id=request_id,
+                    reason="tool_call_budget",
+                    tool_rounds=tool_rounds,
+                    tool_calls=tool_call_count + len(tool_calls),
+                )
+                raise RuntimeError("工具调用超过安全上限")
+
+            assistant_content = "".join(round_text) or None
+            working_messages.append(
+                {
+                    "role": "assistant",
+                    "content": assistant_content,
+                    "tool_calls": [
+                        {
+                            "id": call["id"] or f"call_{index}",
+                            "type": "function",
+                            "function": {
+                                "name": call["name"],
+                                "arguments": call["arguments"] or "{}",
+                            },
+                        }
+                        for index, call in enumerate(tool_calls)
+                    ],
+                }
+            )
+
+            for call in tool_calls:
+                tool_name = call["name"]
+                tool_call_count += 1
+                try:
+                    parsed_arguments = json.loads(call["arguments"] or "{}")
+                    arguments = validate_tool_arguments(tool_name, parsed_arguments)
+                    tool_result = self._run_tool(tool_name, arguments, active_scope)
+                except (
+                    json.JSONDecodeError,
+                    ToolArgumentError,
+                    ValueError,
+                    ZeroDivisionError,
+                    OverflowError,
+                    OSError,
+                ) as error:
+                    arguments = {}
+                    tool_result = f"工具执行失败：{error}"
+
+                tool_result = limit_tool_output(tool_result)
+                self.audit_logger.record(
+                    "tool_call",
+                    request_id=request_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    result=tool_result,
+                    tool_round=tool_rounds,
+                    tool_call_number=tool_call_count,
+                )
+                if on_tool:
+                    on_tool(tool_name, arguments, tool_result)
+
+                working_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call["id"] or f"call_{tool_call_count}",
                         "content": tool_result,
                     }
                 )

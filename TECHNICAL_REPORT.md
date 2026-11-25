@@ -88,38 +88,46 @@ ThesisAgent/
 
 ## 5. API 调用与配置
 
-配置模板在 `.env.example` 中，实际配置放在本地 `.env`：
+配置模板在 `.env.example` 中，实际配置放在本地 `.env`。**项目文件里不再保存任何 API Key**：
 
 ```dotenv
-OPENAI_API_KEY=你的_API_Key
 OPENAI_BASE_URL=模型服务_API_地址
 OPENAI_MODEL=模型名称
+MAX_USERS=200
+MAX_CONVERSATIONS=2
 ```
 
-`agent.py` 中的 `Agent.__init__()` 读取配置并创建客户端：
+Key 有两个来源，都只存在于运行期内存：
+
+- 网页版：登录后由用户在页面上输入，校验通过后传给 `Agent(api_key=...)`，只放在 `st.session_state`；
+- 终端版：启动时用 `getpass.getpass()` 读取（可用 `THESISAGENT_TERMINAL_KEY` 环境变量临时注入，适合脚本）。
+
+`agent.py` 中的 `Agent.__init__()` 在构造客户端时**必须**收到显式传入的 Key：
 
 ```python
-load_dotenv()
-api_key = os.getenv("OPENAI_API_KEY", "").strip()
-base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
+provided_key = (api_key or "").strip()
+if not provided_key:
+    raise RuntimeError("缺少 API Key：请在登录后输入（终端版启动时会提示输入）。")
+
+base_url = (base_url or "").strip() or os.getenv("OPENAI_BASE_URL", "").strip() or None
 self.model = model or os.getenv("OPENAI_MODEL", "").strip()
 
 self.client = OpenAI(
-    api_key=api_key,
+    api_key=provided_key,
     base_url=base_url,
     timeout=30.0,
     max_retries=1,
 )
 ```
 
-这里使用的是“OpenAI SDK + OpenAI 兼容接口”模式：SDK 的调用格式保持统一，`OPENAI_BASE_URL` 决定实际请求发往哪个模型服务。
+这里使用的是“OpenAI SDK + OpenAI 兼容接口”模式：SDK 的调用格式保持统一，`OPENAI_BASE_URL` 决定实际请求发往哪个模型服务。网页端把接口地址做成**部署者配置、用户不可见**，避免用户被引导把 Key 发往钓鱼网关。
 
 安全上必须保证：
 
-1. API Key 只由本地程序读取；
+1. API Key 只由程序在内存中持有，不写进项目文件；
 2. API Key 不进入系统提示词、用户消息或工具结果；
 3. 异常信息和审计日志不能打印完整密钥；
-4. `.env` 不上传到 Git 或发送给模型。
+4. `.env` 里不保存 Key，也不上传到 Git。
 
 ## 6. 工具定义与工具调用
 
@@ -536,11 +544,11 @@ start-agent-web.cmd
 网页端支持：
 
 - 自助注册与登录：第一个注册的账号自动成为唯一管理员，其余都是普通用户；
-- 登录后输入自己的 API Key，校验通过才进入聊天，Key 只存在浏览器会话内存；
-- 输入问题并进行对话，按账号保存历史；
+- 登录后输入自己的 API Key，校验通过才进入聊天，Key 只存在浏览器会话内存；接口地址由部署者配置、用户不可见；
+- 输入问题并进行对话，按账号保存历史；支持多对话（默认每账号上限 2 个，存在 `conversations` 表），可新建、切换、删除；
 - 上传 PDF、Word、Markdown、TXT、CSV 或 JSON 文件到自己的私有目录，管理员上传的资料进入共享目录；
 - 查看"我的资料"和"共享资料"、查看本次请求调用了哪些工具；
-- 清空当前网页会话、修改自己的密码；
+- 清空当前对话的消息、修改自己的密码；
 - 管理员可以查看全部账号并停用/恢复普通用户。
 
 ### 12.2 终端版

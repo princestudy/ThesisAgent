@@ -9,8 +9,13 @@
 from __future__ import annotations
 
 import html
+import io
 import re
+import time
 from pathlib import Path
+
+from docx import Document
+from pypdf import PdfReader
 
 import streamlit as st
 
@@ -19,10 +24,12 @@ import memory
 from agent import Agent, build_system_message
 from auth import AuthError, api_base_url, api_model, verify_api_key
 from scope import (
+    MAX_PREVIEW_BYTES,
     SUPPORTED_KNOWLEDGE_SUFFIXES,
     ToolScope,
     delete_scope_file,
     iter_scope_files,
+    read_scope_file,
     upload_directory,
 )
 from security_controls import (
@@ -31,10 +38,12 @@ from security_controls import (
     redact_sensitive_text,
 )
 
-WEB_SESSION_ID = "web"
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_UPLOAD_FILES = 10
 MAX_HISTORY_TURNS = 10
+# 流式输出时刷新页面的最小间隔（秒）：太勤会让前端一直重排，太慢看起来又像卡住。
+STREAM_FLUSH_INTERVAL = 0.06
+THINKING_HINT = "正在思考…"
 TOOL_LABELS = {
     "calculate": "计算器",
     "get_current_time": "当前时间",
@@ -48,6 +57,25 @@ SUGGESTIONS = (
     "计算 (128 + 72) * 3 / 5",
 )
 MAIN_CAPTION = "可以检索本人资料与管理员共享的资料，也可以使用计算、时间和文件读取工具。"
+# 资料预览：纯文本直接显示，PDF/Word 先抽文字，超过上限只提示下载。
+PREVIEW_CHAR_LIMIT = 8000
+PDF_PREVIEW_PAGES = 20
+PREVIEW_SUFFIXES = {".pdf", ".docx", ".txt", ".md", ".csv", ".json"}
+PREVIEW_MIME = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".md": "text/markdown",
+    ".txt": "text/plain",
+    ".csv": "text/csv",
+    ".json": "application/json",
+}
+# 左侧栏的“工具”入口：点击后打开居中弹窗，不占用对话区。
+TOOL_DIALOGS = {
+    "upload": ("上传资料", 680),
+    "files": ("资料列表", 720),
+    "admin": ("用户管理", 720),
+    "password": ("修改密码", None),
+}
 
 st.set_page_config(
     page_title="论文知识库助手",
@@ -160,9 +188,81 @@ def inject_styles() -> None:
         .stTabs [data-baseweb="tab"] {font-weight: 600; font-size: 15px;}
         .stCaption, [data-testid="stCaptionContainer"] {color: #6B7280;}
         .doc-row {color: #374151; font-size: 14px; padding: 2px 0;}
+    .doc-size {color: #9CA3AF; font-size: 12px; margin-left: 6px;}
         .who {display: flex; flex-direction: column; gap: 2px; padding: 4px 0 6px 2px;}
         .who-name {font-size: 15px; font-weight: 600; color: #111827;}
         .who-role {font-size: 12px; color: #6B7280;}
+        .nav-label {
+            font-size: 12px; font-weight: 600; color: #9CA3AF;
+            letter-spacing: 0.08em; padding: 12px 0 4px 2px;
+        }
+        /* 左侧栏里的按钮做成扁平列表项，接近桌面客户端的观感 */
+        div[data-testid="stColumn"]:has(.sidebar-brand) .stButton > button {
+            background: transparent; border: 1px solid transparent;
+            box-shadow: none; color: #374151; font-weight: 500;
+            justify-content: flex-start; text-align: left;
+            padding: 4px 10px; min-height: 34px;
+        }
+        div[data-testid="stColumn"]:has(.sidebar-brand)
+            .stButton > button > div {
+            justify-content: flex-start;
+        }
+        /* 对话行的“删除”小按钮：字号小一点，不抢视线 */
+        div[class*="st-key-del-"] button {
+            color: #9CA3AF; font-size: 12px; padding: 4px 2px; min-height: 34px;
+            background: transparent; border-color: transparent; box-shadow: none;
+        }
+        div[class*="st-key-del-"] button:hover {color: #EF4444; background: #FEF2F2;}
+        div[role="dialog"] [data-testid="stForm"] {
+            border: none; box-shadow: none; padding: 0; background: transparent;
+        }
+        div[data-testid="stColumn"]:has(.sidebar-brand) .stButton > button:hover {
+            background: #F3F5FB; color: #111827; border-color: #F3F5FB;
+        }
+        div[data-testid="stColumn"]:has(.sidebar-brand)
+            .stButton > button[kind="primary"],
+        div[data-testid="stColumn"]:has(.sidebar-brand)
+            [data-testid="stBaseButton-primary"] {
+            background: #EEF1FF; color: #4D6BFE; border-color: #E2E7FF;
+            font-weight: 600;
+        }
+        .account {display: flex; align-items: center; gap: 10px; padding: 2px 0 8px 2px;}
+        .account-avatar {
+            width: 32px; height: 32px; border-radius: 50%;
+            background: linear-gradient(135deg, #4D6BFE 0%, #7B5CFF 100%);
+            color: #FFFFFF; font-size: 14px; font-weight: 700;
+            display: flex; align-items: center; justify-content: center;
+            flex-shrink: 0;
+        }
+        .account-text {display: flex; flex-direction: column; min-width: 0;}
+        .chat-title {
+            font-size: 18px; font-weight: 700; color: #111827;
+            margin: 0 0 2px 0; line-height: 1.3;
+        }
+        /* 气泡：用户靠右，助手靠左 */
+        [data-testid="stChatMessage"] {
+            gap: 12px; background: transparent; border: none;
+        }
+        [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
+            flex-direction: row-reverse;
+            width: fit-content;
+            margin-left: auto;
+            max-width: 80%;
+            background: #EEF1FF;
+            border: 1px solid #E2E7FF;
+            border-radius: 18px 18px 6px 18px;
+            padding: 10px 16px;
+        }
+        [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"])
+            [data-testid="stChatMessageContent"] {text-align: left;}
+        [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) {
+            padding: 6px 2px;
+        }
+        /* 参照豆包：不显示头像，只靠左右分边区分说话人 */
+        [data-testid="stChatMessage"] [data-testid^="stChatMessageAvatar"] {
+            display: none;
+        }
+        div[role="dialog"] {border-radius: 18px;}
         [data-testid="stBottomBlockContainer"] {
             max-width: 1120px;
             margin: 0 auto;
@@ -177,7 +277,26 @@ def inject_styles() -> None:
             );
             z-index: 10;
         }
-        .st-key-chat_history {padding-bottom: 8.5rem;}
+        /* 消息区高度跟视口走：st.container(height=...) 生成的是 flex 子项，
+           高度由 flex-basis 决定，只改 height 无效，必须一起改 flex。 */
+        div[data-testid="stVerticalBlock"].st-key-chat_history {
+            flex: 0 0 calc(100vh - 250px) !important;
+            height: calc(100vh - 250px) !important;
+        }
+        /* 助手还在等第一个 token 时的等待提示 */
+        .thinking {
+            display: inline-flex; align-items: center; gap: 8px;
+            color: #6B7280; font-size: 14px; padding: 2px 0;
+        }
+        .thinking::before {
+            content: ""; width: 8px; height: 8px; border-radius: 50%;
+            background: #4D6BFE;
+            animation: thinking-pulse 1.1s ease-in-out infinite;
+        }
+        @keyframes thinking-pulse {
+            0%, 100% {opacity: 0.25; transform: scale(0.75);}
+            50% {opacity: 1; transform: scale(1);}
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -240,32 +359,46 @@ def clear_credentials() -> None:
         "user",
         "api_key",
         "agent",
+        "conversation_id",
         "chat_messages",
         "agent_messages",
-        "panel",
+        "dialog",
         "confirm_delete",
         "sidebar_open",
+        "awaiting_reply",
+        "pending_prompt",
+        "preview",
+        "preview_return",
     ):
         st.session_state.pop(key, None)
+
+
+def load_conversation(conversation_id: str) -> None:
+    """把某个对话的历史读进 session_state。"""
+    user = st.session_state.user
+    scope = ToolScope.for_user(user["id"])
+    history = memory.load_recent_messages(
+        limit=20, user_id=str(user["id"]), session_id=conversation_id
+    )
+    st.session_state.conversation_id = conversation_id
+    st.session_state.chat_messages = [
+        {"role": item["role"], "content": item["content"]} for item in history
+    ]
+    st.session_state.agent_messages = [build_system_message(scope), *history]
 
 
 def start_session(user: dict, message: str | None = None) -> None:
     scope = ToolScope.for_user(user["id"])
     scope.ensure_directories()
-    history = memory.load_recent_messages(
-        limit=20,
-        user_id=str(user["id"]),
-        session_id=WEB_SESSION_ID,
-    )
     st.session_state.user = user
     st.session_state.api_key = None
     st.session_state.agent = None
-    st.session_state.panel = None
+    st.session_state.dialog = None
     st.session_state.confirm_delete = None
-    st.session_state.chat_messages = [
-        {"role": item["role"], "content": item["content"]} for item in history
-    ]
-    st.session_state.agent_messages = [build_system_message(scope), *history]
+    st.session_state.preview = None
+    st.session_state.sidebar_open = True
+    conversation_id = memory.ensure_default_conversation(str(user["id"]))
+    load_conversation(conversation_id)
     if message:
         flash(message)
     st.rerun()
@@ -351,13 +484,12 @@ def render_api_key_step() -> None:
         st.caption(f"当前登录：{st.session_state.user['username']}")
         st.markdown(
             "Key 只保存在本次浏览器会话的内存中：不写入数据库，不写入审计日志，"
-            "管理员和其他用户都看不到；刷新页面后需要重新输入。"
+            "管理员和其他用户都看不到；刷新页面后需要重新输入。接口地址由部署者统一配置。"
         )
         with st.form("api_key_form"):
             api_key = st.text_input(
                 "DeepSeek API Key", type="password", placeholder="sk-..."
             )
-            base_url = st.text_input("接口地址", value=api_base_url())
             submitted = st.form_submit_button(
                 "校验并开始使用", use_container_width=True, type="primary"
             )
@@ -369,7 +501,7 @@ def render_api_key_step() -> None:
         if not submitted:
             return
         with st.spinner("正在校验 API Key…"):
-            ok, message = verify_api_key(api_key, base_url or None)
+            ok, message = verify_api_key(api_key, api_base_url())
         if not ok:
             st.error(message)
             return
@@ -377,7 +509,7 @@ def render_api_key_step() -> None:
             agent = Agent(
                 api_key=api_key.strip(),
                 model=api_model(),
-                base_url=base_url.strip() or None,
+                base_url=api_base_url(),
             )
         except RuntimeError as error:
             st.error(redact_sensitive_text(str(error)))
@@ -440,6 +572,118 @@ def render_upload(scope: ToolScope) -> None:
         st.rerun()
 
 
+def format_size(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / 1024 / 1024:.1f} MB"
+
+
+def extract_preview_text(name: str, data: bytes) -> tuple[str, bool]:
+    """把资料转成可读文本；返回 (文本, 是否截断)。不支持的类型返回空串。"""
+    suffix = Path(name).suffix.lower()
+    text = ""
+    if suffix in {".txt", ".md", ".csv", ".json"}:
+        text = data.decode("utf-8", errors="replace")
+    elif suffix == ".pdf":
+        try:
+            reader = PdfReader(io.BytesIO(data))
+            pages = []
+            for number, page in enumerate(reader.pages[:PDF_PREVIEW_PAGES], start=1):
+                content = page.extract_text() or ""
+                if content.strip():
+                    pages.append(f"—— 第 {number} 页 ——\n{content.strip()}")
+            text = "\n\n".join(pages)
+        except Exception as error:  # noqa: BLE001 - 坏 PDF 不应让整页崩掉
+            return f"这个 PDF 无法解析：{error}", False
+    elif suffix == ".docx":
+        try:
+            document = Document(io.BytesIO(data))
+            parts = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
+            for table in document.tables:
+                for row in table.rows:
+                    cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                    if cells:
+                        parts.append(" | ".join(cells))
+            text = "\n".join(parts)
+        except Exception as error:  # noqa: BLE001
+            return f"这个 Word 文件无法解析：{error}", False
+    else:
+        return "", False
+    truncated = len(text) > PREVIEW_CHAR_LIMIT
+    return text[:PREVIEW_CHAR_LIMIT], truncated
+
+
+def open_preview(path: Path, directory: Path) -> None:
+    # Streamlit 同一时刻只允许一个弹窗：打开预览前先把资料列表收起来，
+    # 记下它，关掉预览再自动回到列表。
+    st.session_state.preview_return = st.session_state.get("dialog")
+    st.session_state.dialog = None
+    st.session_state.preview = {"path": str(path), "directory": str(directory)}
+    st.rerun()
+
+
+def close_preview() -> None:
+    st.session_state.preview = None
+    back_to = st.session_state.get("preview_return")
+    st.session_state.preview_return = None
+    if back_to:
+        st.session_state.dialog = back_to
+        st.rerun()
+
+
+def render_preview_dialog() -> None:
+    """资料预览弹窗：先看内容，再决定要不要下载。"""
+    state = st.session_state.get("preview")
+    if not state:
+        return
+
+    def dialog_body() -> None:
+        path = Path(state["path"])
+        directory = Path(state["directory"])
+        try:
+            data = read_scope_file(path, directory)
+        except (ValueError, OSError) as error:
+            st.error(str(error))
+            if st.button("关闭", use_container_width=True):
+                close_preview()
+                st.rerun()
+            return
+
+        suffix = path.suffix.lower()
+        st.caption(f"{format_size(len(data))} · 只读预览，下载后可用本地软件打开")
+        text, truncated = extract_preview_text(path.name, data)
+        if text:
+            with st.container(height=420, border=False):
+                if suffix == ".md":
+                    st.markdown(text)
+                else:
+                    st.text(text)
+            if truncated:
+                st.caption(
+                    f"内容较长，这里只显示前 {PREVIEW_CHAR_LIMIT} 个字符，完整内容请下载查看。"
+                )
+        else:
+            st.info("这种格式没法在网页里预览，请直接下载。")
+        st.download_button(
+            "下载文件",
+            data=data,
+            file_name=path.name,
+            mime=PREVIEW_MIME.get(suffix, "application/octet-stream"),
+            use_container_width=True,
+            key=f"download-{path.name}",
+        )
+
+    title = Path(state["path"]).name
+    kwargs = {"on_dismiss": close_preview}
+    try:
+        opener = st.dialog(title, width=760, **kwargs)
+    except TypeError:  # 老版本 Streamlit 没有 width / on_dismiss
+        opener = st.dialog(title)
+    opener(dialog_body)()
+
+
 def render_file_section(
     title: str,
     files: list[Path],
@@ -448,23 +692,32 @@ def render_file_section(
     deletable: bool,
     key_prefix: str,
 ) -> None:
-    """列出一组资料；可删除时每行带"删除 → 确认/取消"两步操作。"""
+    """列出一组资料；每行可以查看内容，可删除时还带"删除 → 确认/取消"两步操作。"""
     st.caption(f"{title} · {len(files)} 个")
     pending = st.session_state.get("confirm_delete")
     for index, path in enumerate(files):
         marker = str(path)
         if deletable:
-            columns = st.columns([5, 1.25, 1.1])
+            columns = st.columns([3.1, 1.0, 1.1, 1.0])
         else:
-            columns = st.columns([5])
+            columns = st.columns([3.7, 1.05])
+        try:
+            size_text = format_size(path.stat().st_size)
+        except OSError:
+            size_text = ""
         columns[0].markdown(
-            f'<div class="doc-row">· {html.escape(path.name)}</div>',
+            f'<div class="doc-row">· {html.escape(path.name)}'
+            f'<span class="doc-size">{html.escape(size_text)}</span></div>',
             unsafe_allow_html=True,
         )
+        if columns[1].button(
+            "查看", key=f"view-{key_prefix}-{index}", use_container_width=True
+        ):
+            open_preview(path, directory)
         if not deletable:
             continue
         if pending == marker:
-            if columns[1].button(
+            if columns[2].button(
                 "确认删除", key=f"confirm-{key_prefix}-{index}", use_container_width=True
             ):
                 try:
@@ -475,12 +728,12 @@ def render_file_section(
                     flash(f"已删除 {path.name}。")
                 st.session_state.confirm_delete = None
                 st.rerun()
-            if columns[2].button(
+            if columns[3].button(
                 "取消", key=f"cancel-{key_prefix}-{index}", use_container_width=True
             ):
                 st.session_state.confirm_delete = None
                 st.rerun()
-        elif columns[2].button(
+        elif columns[3].button(
             "删除", key=f"delete-{key_prefix}-{index}", use_container_width=True
         ):
             st.session_state.confirm_delete = marker
@@ -520,7 +773,6 @@ def render_file_lists(scope: ToolScope) -> None:
 
 
 def render_change_password() -> None:
-    st.markdown("**修改密码**")
     st.caption("管理员也只能修改自己的密码。")
     with st.form("password_form"):
         current = st.text_input("当前密码", type="password")
@@ -546,7 +798,6 @@ def render_change_password() -> None:
 
 
 def render_admin_panel() -> None:
-    st.markdown("**用户管理**")
     st.caption("管理员有且只有一个；这里可以查看全部账号，并停用或恢复普通用户。")
     for account in auth.list_users():
         account_id = int(account["id"])
@@ -571,15 +822,16 @@ def render_admin_panel() -> None:
         st.divider()
 
 
-# ---------------------------------------------------------------- 顶部工具条
+# ---------------------------------------------------------------- 左侧栏与弹窗
 
 
-PANELS = {
-    "upload": "上传资料",
-    "files": "资料列表",
-    "password": "修改密码",
-    "admin": "用户管理",
-}
+def open_dialog(key: str) -> None:
+    st.session_state.dialog = key
+    st.rerun()
+
+
+def close_dialog() -> None:
+    st.session_state.dialog = None
 
 
 def toggle_sidebar(open_state: bool) -> None:
@@ -587,27 +839,65 @@ def toggle_sidebar(open_state: bool) -> None:
     st.rerun()
 
 
-def toggle_panel(key: str) -> None:
-    active = st.session_state.get("panel")
-    st.session_state.panel = None if active == key else key
+def new_conversation() -> None:
+    user = st.session_state.user
+    try:
+        conversation_id = memory.create_conversation(str(user["id"]))
+    except memory.ConversationLimitError as error:
+        flash(str(error), "warning")
+        st.rerun()
+        return
+    st.session_state.awaiting_reply = False
+    load_conversation(conversation_id)
     st.rerun()
 
 
-def clear_chat(scope: ToolScope) -> None:
+def switch_conversation(conversation_id: str) -> None:
+    if conversation_id == st.session_state.get("conversation_id"):
+        return
+    st.session_state.awaiting_reply = False
+    load_conversation(conversation_id)
+    st.rerun()
+
+
+def remove_conversation(conversation_id: str) -> None:
     user = st.session_state.user
-    memory.clear_messages(user_id=str(user["id"]), session_id=WEB_SESSION_ID)
-    st.session_state.chat_messages = []
-    st.session_state.agent_messages = [build_system_message(scope)]
-    st.session_state.panel = None
+    user_id = str(user["id"])
+    memory.delete_conversation(conversation_id, user_id)
+    remaining = memory.list_conversations(user_id)
+    if not remaining:
+        remaining_id = memory.ensure_default_conversation(user_id)
+    else:
+        remaining_id = remaining[0]["id"]
+    if conversation_id == st.session_state.get("conversation_id"):
+        load_conversation(remaining_id)
+    flash("对话已删除。")
+    st.rerun()
+
+
+def clear_current_conversation() -> None:
+    user = st.session_state.user
+    conversation_id = st.session_state.get("conversation_id")
+    if not conversation_id:
+        return
+    memory.clear_messages(user_id=str(user["id"]), session_id=conversation_id)
+    st.session_state.awaiting_reply = False
+    load_conversation(conversation_id)
     flash("当前对话已清空。")
     st.rerun()
 
 
+def conversation_label(conversation: dict) -> str:
+    title = (conversation.get("title") or "新对话").strip()
+    return title if len(title) <= 12 else title[:12] + "…"
+
+
 def render_sidebar(scope: ToolScope) -> None:
-    """常驻左栏：品牌、功能入口、账号信息。折叠状态由 sidebar_open 控制。"""
+    """常驻左栏：品牌、新对话、对话列表、工具入口、左下角账号区。"""
     user = st.session_state.user
+    user_id = str(user["id"])
     role = "管理员" if user["is_admin"] else "普通用户"
-    active = st.session_state.get("panel")
+    active_conversation = st.session_state.get("conversation_id")
 
     with st.container(border=True):
         st.markdown(
@@ -617,55 +907,99 @@ def render_sidebar(scope: ToolScope) -> None:
             "</div>",
             unsafe_allow_html=True,
         )
-        st.caption("会话与资料按账号隔离")
-        if st.button("« 收起侧栏", key="sidebar-collapse", use_container_width=True):
-            toggle_sidebar(False)
+        if st.button(
+            "＋ 新对话",
+            key="new-conversation",
+            use_container_width=True,
+        ):
+            new_conversation()
+
+        st.markdown('<div class="nav-label">对话</div>', unsafe_allow_html=True)
+        conversations = memory.list_conversations(user_id)
+        for conversation in conversations:
+            is_active = conversation["id"] == active_conversation
+            title_column, action_column = st.columns([5.2, 1.4])
+            if title_column.button(
+                conversation_label(conversation),
+                key=f"conv-{conversation['id']}",
+                use_container_width=True,
+                type="primary" if is_active else "secondary",
+            ):
+                switch_conversation(conversation["id"])
+            if action_column.button(
+                "删除", key=f"del-{conversation['id']}", help="删除这个对话"
+            ):
+                remove_conversation(conversation["id"])
 
         st.markdown('<div class="nav-gap"></div>', unsafe_allow_html=True)
-        entries = [
-            ("upload", PANELS["upload"]),
-            ("files", PANELS["files"]),
-            ("password", PANELS["password"]),
-        ]
+        st.markdown('<div class="nav-label">工具</div>', unsafe_allow_html=True)
+        entries = [("upload", "上传资料"), ("files", "资料列表")]
         if user["is_admin"]:
-            entries.append(("admin", PANELS["admin"]))
+            entries.append(("admin", "用户管理"))
         for key, label in entries:
-            if st.button(
-                ("● " if active == key else "") + label,
-                key=f"panel_{key}",
-                use_container_width=True,
-                type="primary" if active == key else "secondary",
-            ):
-                toggle_panel(key)
-        if st.button("清空对话", key="panel_clear", use_container_width=True):
-            clear_chat(scope)
+            if st.button(label, key=f"dialog-{key}", use_container_width=True):
+                open_dialog(key)
+        if conversations and st.button(
+            "清空当前对话", key="clear-conversation", use_container_width=True
+        ):
+            clear_current_conversation()
 
         st.divider()
         st.markdown(
-            '<div class="who">'
+            '<div class="account">'
+            '<span class="account-avatar">'
+            f'{html.escape(str(user["username"])[:1].upper())}</span>'
+            '<span class="account-text">'
             f'<span class="who-name">{html.escape(user["username"])}</span>'
             f'<span class="who-role">{role} · 已登录</span>'
+            "</span>"
             "</div>",
             unsafe_allow_html=True,
         )
-        if st.button("退出登录", key="logout", use_container_width=True):
+        password_column, logout_column = st.columns(2)
+        if password_column.button("修改密码", key="open-password", use_container_width=True):
+            open_dialog("password")
+        if logout_column.button("退出登录", key="logout", use_container_width=True):
             clear_credentials()
             st.rerun()
 
 
-def render_panel_area(scope: ToolScope) -> None:
-    panel = st.session_state.get("panel")
-    if not panel:
+def render_active_dialog(scope: ToolScope) -> None:
+    """左侧栏的工具入口统一用居中弹窗展示，不占用对话区。"""
+    if st.session_state.get("preview"):
+        # 预览弹窗优先，避免同时开两个弹窗（Streamlit 不允许）。
         return
-    with st.container(border=True):
-        if panel == "upload":
-            render_upload(scope)
-        elif panel == "files":
-            render_file_lists(scope)
-        elif panel == "password":
-            render_change_password()
-        elif panel == "admin" and st.session_state.user["is_admin"]:
-            render_admin_panel()
+    key = st.session_state.get("dialog")
+    if not key:
+        return
+    user = st.session_state.get("user") or {}
+    if key == "admin" and not user.get("is_admin"):
+        st.session_state.dialog = None
+        return
+    spec = TOOL_DIALOGS.get(key)
+    if not spec:
+        st.session_state.dialog = None
+        return
+    title, width = spec
+    renderers = {
+        "upload": lambda: render_upload(scope),
+        "files": lambda: render_file_lists(scope),
+        "admin": render_admin_panel,
+        "password": render_change_password,
+    }
+    renderer = renderers[key]
+
+    def dialog_body() -> None:
+        renderer()
+
+    kwargs = {"on_dismiss": close_dialog}
+    if width:
+        kwargs["width"] = width
+    try:
+        opener = st.dialog(title, **kwargs)
+    except TypeError:  # 老版本 Streamlit 没有 width / on_dismiss
+        opener = st.dialog(title)
+    opener(dialog_body)()
 
 
 # ---------------------------------------------------------------- 聊天
@@ -687,8 +1021,21 @@ def trim_agent_messages() -> None:
         st.session_state.agent_messages = [messages[0], *messages[-keep:]]
 
 
+def render_chat_header() -> None:
+    user = st.session_state.user
+    conversation = memory.get_conversation(
+        st.session_state.get("conversation_id") or "", str(user["id"])
+    )
+    title = (conversation or {}).get("title") or "新对话"
+    st.markdown(
+        f'<div class="chat-title">{html.escape(title)}</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(MAIN_CAPTION)
+
+
 def render_history(scope: ToolScope) -> None:
-    with st.container(key="chat_history"):
+    with st.container(key="chat_history", height=520, border=False, autoscroll=True):
         for message in st.session_state.chat_messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
@@ -702,11 +1049,83 @@ def render_history(scope: ToolScope) -> None:
                     st.session_state.pending_prompt = suggestion
                     st.rerun()
 
+        if st.session_state.get("awaiting_reply"):
+            render_streaming_reply(scope)
+
+
+def render_streaming_reply(scope: ToolScope) -> None:
+    """用户消息已经落库后，在这里等模型第一段输出，并把后续内容逐字贴出来。"""
+    user = st.session_state.user
+    user_id = str(user["id"])
+    conversation_id = st.session_state.get("conversation_id")
+    tool_events: list[dict] = []
+
+    def record_tool(name: str, arguments: dict, result: str) -> None:
+        tool_events.append({"name": name, "arguments": arguments, "result": result})
+
+    chunks: list[str] = []
+    with st.chat_message("assistant"):
+        status = st.empty()
+        body = st.empty()
+        status.markdown(
+            f'<div class="thinking">{THINKING_HINT}</div>', unsafe_allow_html=True
+        )
+        last_push = 0.0
+        try:
+            for chunk in st.session_state.agent.stream(
+                st.session_state.agent_messages,
+                on_tool=record_tool,
+                request_id=f"web-{user['id']}",
+                user_id=user_id,
+                session_id=conversation_id,
+                scope=scope,
+            ):
+                chunks.append(chunk)
+                now = time.monotonic()
+                if now - last_push >= STREAM_FLUSH_INTERVAL:
+                    last_push = now
+                    if status is not None:
+                        status.empty()
+                        status = None
+                    body.markdown(mask_api_keys("".join(chunks)) + "▌")
+        except Exception as error:  # noqa: BLE001 - 网络和鉴权错误都要兜住
+            detail = redact_sensitive_text(str(error)).strip()
+            chunks = ["这次回答没有成功：" + (detail[:300] if detail else "请稍后重试。")]
+
+        if status is not None:
+            status.empty()
+        answer = mask_api_keys("".join(chunks).strip())
+        if not answer:
+            answer = "模型没有返回文字内容。"
+        body.markdown(answer)
+        render_tool_events(tool_events)
+
+    st.session_state.agent_messages.append({"role": "assistant", "content": answer})
+    st.session_state.chat_messages.append(
+        {"role": "assistant", "content": answer, "tools": tool_events}
+    )
+    st.session_state.awaiting_reply = False
+    trim_agent_messages()
+    memory.save_message(
+        "assistant", answer, user_id=user_id, session_id=conversation_id
+    )
+    memory.touch_conversation(conversation_id, user_id)
+    # 重绘一次：让消息从「流式占位」变成正式的历史消息，同时恢复输入框。
+    st.rerun()
+
 
 def handle_prompt(scope: ToolScope) -> None:
-    agent = st.session_state.agent
+    user = st.session_state.user
+    user_id = str(user["id"])
+    conversation_id = st.session_state.get("conversation_id")
+    if not conversation_id:
+        conversation_id = memory.ensure_default_conversation(user_id)
+        load_conversation(conversation_id)
 
-    prompt = st.chat_input("给论文知识库助手发消息…")
+    prompt = st.chat_input(
+        "给论文知识库助手发消息…",
+        disabled=bool(st.session_state.get("awaiting_reply")),
+    )
     if not prompt:
         prompt = st.session_state.pop("pending_prompt", None)
     if not prompt:
@@ -715,49 +1134,16 @@ def handle_prompt(scope: ToolScope) -> None:
         st.error("消息里似乎有 API Key，已拒绝发送。Key 请只在登录后的输入框里填写。")
         return
 
-    user = st.session_state.user
+    conversation = memory.get_conversation(conversation_id, user_id)
+    if conversation and conversation["title"] in ("新对话", ""):
+        memory.rename_conversation(conversation_id, prompt[:16], user_id)
+
+    # 用户消息先落库、再重绘，这样点完发送立刻就能在对话里看到自己的问题。
     st.session_state.chat_messages.append({"role": "user", "content": prompt})
     st.session_state.agent_messages.append({"role": "user", "content": prompt})
-    memory.save_message(
-        "user", prompt, user_id=str(user["id"]), session_id=WEB_SESSION_ID
-    )
-
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    tool_events: list[dict] = []
-
-    def record_tool(name: str, arguments: dict, result: str) -> None:
-        tool_events.append({"name": name, "arguments": arguments, "result": result})
-
-    with st.chat_message("assistant"):
-        with st.spinner("正在查阅资料并思考…"):
-            try:
-                answer = agent.run(
-                    st.session_state.agent_messages,
-                    on_tool=record_tool,
-                    request_id=f"web-{user['id']}",
-                    user_id=str(user["id"]),
-                    session_id=WEB_SESSION_ID,
-                    scope=scope,
-                )
-            except Exception as error:  # noqa: BLE001 - 网络和鉴权错误都要兜住
-                answer = "这次回答没有成功："
-                detail = redact_sensitive_text(str(error)).strip()
-                answer += detail[:300] if detail else "请稍后重试。"
-        answer = mask_api_keys(str(answer))
-        st.markdown(answer)
-        render_tool_events(tool_events)
-
-    st.session_state.agent_messages.append({"role": "assistant", "content": answer})
-    st.session_state.chat_messages.append(
-        {"role": "assistant", "content": answer, "tools": tool_events}
-    )
-    trim_agent_messages()
-    memory.save_message(
-        "assistant", answer, user_id=str(user["id"]), session_id=WEB_SESSION_ID
-    )
-    # 重绘一次，让「可以试着问我」这类空状态提示在产生对话后立即消失。
+    memory.save_message("user", prompt, user_id=user_id, session_id=conversation_id)
+    memory.touch_conversation(conversation_id, user_id)
+    st.session_state.awaiting_reply = True
     st.rerun()
 
 
@@ -783,9 +1169,8 @@ def main() -> None:
         with sidebar_column:
             render_sidebar(scope)
         with main_column:
-            st.caption(MAIN_CAPTION)
+            render_chat_header()
             show_flash()
-            render_panel_area(scope)
             render_history(scope)
     else:
         toggle_column, brand_column = st.columns([1, 11])
@@ -795,8 +1180,10 @@ def main() -> None:
         with brand_column:
             render_brand()
         show_flash()
-        render_panel_area(scope)
         render_history(scope)
+
+    render_active_dialog(scope)
+    render_preview_dialog()
 
     # 输入框放在页面顶层，Streamlit 会把它停靠到窗口底部。
     inject_bottom_bar_offset(sidebar_open)
