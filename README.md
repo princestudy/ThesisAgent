@@ -542,7 +542,24 @@ git commit -m "Remove local sensitive files"
 
 这不会删除本地文件，只会停止 Git 跟踪。
 
-## 11. 文档与进一步学习
+## 11. 部署到公网（可选）
+
+想给别人一个能直接打开的链接，推荐 **Streamlit Community Cloud**（免费，出 `https://xxx.streamlit.app`）：
+
+1. 用 GitHub 登录 https://share.streamlit.io ；
+2. **New app** → 选本仓库、分支 `main`、主文件 `app.py`；
+3. Python 版本选 3.12，点 **Deploy**，等依赖装完。
+
+注意两点：
+
+- 链接是公开的，**第一个注册的账号会成为唯一管理员**，部署完请立刻自己注册，再把链接发出去；
+- 免费实例闲置会休眠（首次打开要等 20–30 秒），且重启后 SQLite 数据会被清空；`MAX_USERS`、`MAX_CONVERSATIONS`、`OPENAI_BASE_URL` 可以在 App 的 **Secrets** 里用 TOML 覆盖（环境变量优先，其次 secrets）。
+
+完整的步骤、Secrets 示例、常见报错处理见 [`docs/deploy.md`](docs/deploy.md)。
+
+> GitHub Pages 不能用来跑本项目——它只能托管静态页面，而 Streamlit 需要 Python 进程在服务端运行。
+
+## 12. 文档与进一步学习
 
 项目中的详细材料：
 
@@ -562,7 +579,7 @@ git commit -m "Remove local sensitive files"
 8. 每次只修改一个安全控制并比较结果
 ```
 
-## 12. 项目限制
+## 13. 项目限制
 
 当前版本已经做到：
 

@@ -1,19 +1,40 @@
 import os
 import sqlite3
+import tempfile
 import uuid
 from contextlib import closing
 from pathlib import Path
 
+import config
+
+
+def _resolve_db_path() -> Path:
+    """决定 SQLite 文件放哪儿。
+
+    优先级：配置里的 THESISAGENT_DB > 项目目录（可写时） > 系统临时目录。
+    云端（Streamlit Community Cloud）上项目目录可能不可写，而临时目录一定可写；
+    两种情况重启都会丢数据，要持久化请把 THESISAGENT_DB 指到挂载卷。
+    """
+    configured = str(config.get("THESISAGENT_DB", "")).strip()
+    if configured:
+        return Path(configured).expanduser()
+
+    project_db = Path(__file__).resolve().parent / "memory.db"
+    if os.access(project_db.parent, os.W_OK):
+        return project_db
+
+    fallback_dir = Path(tempfile.gettempdir()) / "thesisagent"
+    fallback_dir.mkdir(parents=True, exist_ok=True)
+    return fallback_dir / "memory.db"
+
+
 # 部署时可以用 THESISAGENT_DB 指向挂载卷，默认放在项目目录。
-DB_PATH = Path(
-    os.getenv("THESISAGENT_DB", "")
-    or (Path(__file__).resolve().parent / "memory.db")
-)
+DB_PATH = _resolve_db_path()
 DEFAULT_USER_ID = "local-user"
 DEFAULT_SESSION_ID = "terminal"
 MAX_MEMORY_MESSAGES = 100
 # 每个用户最多保留几个对话（网页版新建对话时的上限）。
-MAX_CONVERSATIONS = max(1, int(os.getenv("MAX_CONVERSATIONS", "2") or 2))
+MAX_CONVERSATIONS = max(1, config.get_int("MAX_CONVERSATIONS", 2))
 NEW_CONVERSATION_TITLE = "新对话"
 LEGACY_CONVERSATION_ID = "web"
 LEGACY_CONVERSATION_TITLE = "历史对话"

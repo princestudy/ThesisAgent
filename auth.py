@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import os
 import re
 import secrets
 import sqlite3
@@ -26,13 +25,13 @@ from openai import (
     OpenAI,
 )
 
+import config
 import memory
-
 MAX_FAILED_ATTEMPTS = 5
 LOCK_MINUTES = 15
 MIN_PASSWORD_LENGTH = 8
 MAX_PASSWORD_LENGTH = 128
-MAX_USERS = int(os.getenv("MAX_USERS", "200") or "200")
+MAX_USERS = max(1, config.get_int("MAX_USERS", 200))
 SCRYPT_N = 2**14
 SCRYPT_R = 8
 SCRYPT_P = 1
@@ -69,11 +68,11 @@ class AuthError(RuntimeError):
 
 
 def api_base_url() -> str:
-    return os.getenv("OPENAI_BASE_URL", "").strip() or DEFAULT_BASE_URL
+    return str(config.get("OPENAI_BASE_URL", "")).strip() or DEFAULT_BASE_URL
 
 
 def api_model() -> str:
-    return os.getenv("OPENAI_MODEL", "").strip() or DEFAULT_MODEL
+    return str(config.get("OPENAI_MODEL", "")).strip() or DEFAULT_MODEL
 
 
 def _raw_connect() -> sqlite3.Connection:
