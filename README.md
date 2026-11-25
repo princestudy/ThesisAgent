@@ -1,5 +1,7 @@
 # ThesisAgent：论文知识库与安全实验 Agent
 
+**在线体验：<https://thesisagent-xzh.streamlit.app>**（Streamlit Community Cloud 免费实例，闲置会休眠，首次打开可能需要等 20–30 秒唤醒）
+
 ThesisAgent 是一个使用 Python 编写的本地智能体学习项目。它可以调用大语言模型 API，根据用户问题选择工具，检索本地论文资料，并通过安全控制模块限制工具权限和资源消耗。
 
 这个项目适合学习：
