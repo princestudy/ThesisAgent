@@ -264,6 +264,9 @@ def ensure_admin_account() -> str | None:
     existing = get_user(username)
     if existing:
         if existing["is_admin"]:
+            # Secrets 里的密码是管理员密码的权威来源：对不上就同步过来，避免锁死。
+            if not _password_matches(username, fixed_password):
+                _force_password(username, fixed_password)
             return None
         if has_admin():
             return f"用户名 {username} 已经被普通用户占用，请换一个 ADMIN_USERNAME。"
@@ -274,6 +277,8 @@ def ensure_admin_account() -> str | None:
                 (existing["id"],),
             )
             connection.commit()
+        if not _password_matches(username, fixed_password):
+            _force_password(username, fixed_password)
         return None
 
     if has_admin():
@@ -283,6 +288,30 @@ def ensure_admin_account() -> str | None:
     except AuthError as error:
         return f"创建固定管理员失败：{error}"
     return None
+
+
+def _password_matches(username: str, password: str) -> bool:
+    with closing(_connect()) as connection:
+        row = connection.execute(
+            "SELECT password_salt, password_hash FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
+    if not row:
+        return False
+    salt = bytes.fromhex(row["password_salt"])
+    return hmac.compare_digest(_hash_password(password, salt), row["password_hash"])
+
+
+def _force_password(username: str, password: str) -> None:
+    salt = secrets.token_bytes(16)
+    password_hash = _hash_password(password, salt)
+    with closing(_connect()) as connection:
+        connection.execute(
+            "UPDATE users SET password_salt = ?, password_hash = ?, "
+            "failed_attempts = 0, locked_until = NULL WHERE username = ?",
+            (salt.hex(), password_hash, username),
+        )
+        connection.commit()
 
 
 def _row_to_user(row: sqlite3.Row) -> dict[str, object]:

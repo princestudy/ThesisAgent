@@ -554,7 +554,7 @@ git commit -m "Remove local sensitive files"
 
 注意两点：
 
-- 链接是公开的：默认规则下**第一个注册的账号是唯一管理员**，部署完请立刻自己注册；也可以在 Secrets 里配 `ADMIN_USERNAME` + `ADMIN_PASSWORD` 建固定管理员（应用启动时自动创建，谁先注册都不影响），再用 `INVITE_CODE` 限制注册；
+- 链接是公开的：默认规则下**第一个注册的账号是唯一管理员**，部署完请立刻自己注册；也可以在 Secrets 里配 `ADMIN_USERNAME` + `ADMIN_PASSWORD` 建固定管理员（应用启动时自动创建，谁先注册都不影响；**Secrets 里的密码是权威来源**，每次启动对不上就自动同步，忘了密码直接改 Secrets 即可），再用 `INVITE_CODE` 限制注册；
 - 免费实例闲置会休眠（首次打开要等 20–30 秒），且重启后 SQLite 数据会被清空；`MAX_USERS`、`MAX_CONVERSATIONS`、`OPENAI_BASE_URL`、`ADMIN_USERNAME`、`ADMIN_PASSWORD`、`INVITE_CODE` 都可以在 App 的 **Secrets** 里用 TOML 覆盖（环境变量优先，其次 secrets）。
 
 完整的步骤、Secrets 示例、常见报错处理见 [`docs/deploy.md`](docs/deploy.md)。
