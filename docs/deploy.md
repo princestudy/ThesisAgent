@@ -68,6 +68,8 @@ INVITE_CODE = "给我同学的口令"
 
 保存后应用会自动重启。不填就用代码里的默认值（`MAX_USERS=200`、`deepseek-chat`、第一个注册者是管理员、注册不需要邀请码）。
 
+![配了邀请码后的注册页](ui/register-invite.png)
+
 配置了 `ADMIN_USERNAME` 时：
 
 - 第一次启动自动建号（密码取 `ADMIN_PASSWORD`），用这组账号密码直接登录即可；
